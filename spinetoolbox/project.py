@@ -17,11 +17,10 @@ Spine Toolbox project class.
 """
 from enum import auto, Enum, unique
 from itertools import takewhile, chain
+from copy import deepcopy
 import os
 import json
-import networkx as nx
 from PySide2.QtCore import Signal
-
 from spine_engine.exception import EngineInitFailed
 from spine_engine.project_item.connection import Connection, Jump
 from spine_engine.spine_engine import ExecutionDirection, validate_jumps
@@ -101,6 +100,7 @@ class SpineToolboxProject(MetaObject):
         self._jumps = list()
         self._logger = logger
         self._settings = settings
+        self.clean_project_dict = dict()
         self.dag_handler = DirectedGraphHandler()
         self._engine_workers = []
         self._execution_stopped = True
@@ -194,6 +194,7 @@ class SpineToolboxProject(MetaObject):
         }
         items_dict = {name: item.item_dict() for name, item in self._project_items.items()}
         saved_dict = dict(project=project_dict, items=items_dict)
+        self.clean_project_dict = deepcopy(saved_dict)
         with open(self.config_file, "w") as fp:
             self._dump(saved_dict, fp)
         return True
@@ -219,6 +220,7 @@ class SpineToolboxProject(MetaObject):
             bool: True if the operation was successful, False otherwise
         """
         project_dict = self._load_project_dict()
+        self.clean_project_dict = deepcopy(project_dict)
         if project_dict is None:
             return False
         project_info = ProjectUpgrader(self._toolbox).upgrade(project_dict, self.project_dir)

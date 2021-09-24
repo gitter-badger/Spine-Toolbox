@@ -225,6 +225,39 @@ class ProjectItem(MetaObject):
         else:
             self.get_icon().rank_icon.set_rank("X")
 
+    def compare_and_replace(self, key, d):
+        """Compares item dictionaries if there are actual changes.
+        Reverts changes to lists where the old and the new lists
+        contain the same items but may be in a different order.
+
+        This should be used in item_dict() methods when the project is saved.
+        Without this check, the ordering of lists may be different which results
+        into unnecessary changes in project files, which are annoying when the
+        project is in Git.
+
+        Args:
+            key (str): Dictionary key that must contain a list
+            d (dict): Fresh item_dict dictionary
+
+        Returns:
+            dict: The same dictionary that was given as argument but
+            some lists may have had their ordering changed back to
+            what it was before.
+        """
+        # item_dict in a state in which it was the last time the undo stack was clean
+        clean_item_dict = self._project.clean_project_dict["items"]
+        try:
+            old_list = clean_item_dict[self.name][key]
+        except NameError:
+            old_list = list()
+        if sorted(old_list) == sorted(d[key]):  # No change, use the old list in saving
+            # print(f"{self.name}'s key '{key}'s are the same")
+            d[key] = old_list
+        else:  # Selections have changed, keep it
+            # print(f"{self.name} key {key} list has changed")
+            pass
+        return d
+
     @property
     def executable_class(self):
         raise NotImplementedError()
