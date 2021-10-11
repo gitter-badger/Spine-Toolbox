@@ -267,7 +267,7 @@ def pyside2_version_check():
 
             To upgrade PySide2 to latest supported version, run
 
-                pip install -r requirements.txt --upgrade
+                pip install -U .
 
             And start the application again.
             """

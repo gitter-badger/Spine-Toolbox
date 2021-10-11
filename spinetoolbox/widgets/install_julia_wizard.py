@@ -117,7 +117,7 @@ class JillNotFoundPage(QWizardPage):
         layout.addWidget(HyperTextLabel(point3))
         layout.addWidget(LabelWithCopyButton(f"cd {toolbox_dir}"))
         layout.addWidget(HyperTextLabel(point4))
-        layout.addWidget(LabelWithCopyButton("python -m pip install --upgrade -r requirements.txt"))
+        layout.addWidget(LabelWithCopyButton("python -m pip install --upgrade ."))
         layout.addWidget(HyperTextLabel(point5))
 
 

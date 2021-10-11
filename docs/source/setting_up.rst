@@ -31,7 +31,7 @@ installation options are:
    `Spine Toolbox releases <https://github.com/Spine-project/Spine-Toolbox/releases>`_.
    The installation bundles are only available for Windows at the moment.
 2. Cloning Spine Toolbox Git repository from `<https://github.com/Spine-project/Spine-Toolbox>`_. Checkout branch
-   **release-0.6** or **master** and run `pip install -r requirements.txt` in the repo root.
+   **release-0.6** or **master** and run `pip install -e .` in the repo root.
 
 .. tip:: You can always see the current Python configured for Spine Toolbox from the `Tools` page in
    `File->Settings...`.

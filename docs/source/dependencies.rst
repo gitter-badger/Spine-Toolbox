@@ -14,8 +14,8 @@ recommended for developers. If you want to deploy the application yourself by us
 
 At the moment, Spine Toolbox depends on four main packages (*spinetoolbox*, *spine-engine*, *spine-items*,
 and *spinedb-api*) developed in Spine project.
-For version number limitations, please see `requirements.txt` and `setup.py` files in *spinetoolbox*,
-*spine-engine*, *spine-items*, and *spinedb-api* packages
+For version number limitations, please see `setup.cfg` files in *spinetoolbox*,
+*spine-engine*, *spine-items*, and *spinedb-api* packages.
 
 Dependencies by package
 -----------------------

@@ -44,6 +44,6 @@ major = 0
 minor = 6
 micro = 6
 releaselevel = "dev"
-serial = 0
+serial = 1
 __version_info__ = VersionInfo(major, minor, micro, releaselevel, serial)
 __version__ = str(__version_info__)
