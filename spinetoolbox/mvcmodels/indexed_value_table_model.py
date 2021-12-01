@@ -47,6 +47,8 @@ class IndexedValueTableModel(QAbstractTableModel):
                 return None
             if index.column() == 0:
                 return str(self._value.indexes[index.row()])
+            if role == Qt.DisplayRole:
+                return float(self._value.values[index.row()])
             return locale.str(self._value.values[index.row()])
         if role == Qt.BackgroundRole:
             if index.row() == len(self._value):

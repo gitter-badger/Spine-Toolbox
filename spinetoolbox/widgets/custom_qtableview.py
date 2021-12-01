@@ -306,7 +306,7 @@ class IndexedParameterValueTableViewBase(CopyPasteTableView):
         data_values = row_count * [None]
         data_model = self.model()
         for selected_index in selected_indexes:
-            data = data_model.data(selected_index)
+            data = data_model.data(selected_index, role=Qt.EditRole)
             row = selected_index.row()
             if selected_index.column() == 0:
                 data_indexes[row - row_first] = data
@@ -324,7 +324,6 @@ class IndexedParameterValueTableViewBase(CopyPasteTableView):
                 else:
                     for index, value in zip(data_indexes, data_values):
                         index = index if index is not None else ""
-                        value = locale.str(value) if value is not None else ""
                         writer.writerow([index, value])
             QApplication.clipboard().setText(output.getvalue())
         return True
