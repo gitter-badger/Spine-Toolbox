@@ -138,6 +138,7 @@ class SpineDBManager(QObject):
         self._db_maps = {}
         self.db_map_locks = {}
         self._worker_thread = QThread()
+        self._worker_thread = qApp.thread()
         self._worker = SpineDBWorker(self)
         self._fetchers = {}
         self.undo_stack = {}
@@ -287,31 +288,10 @@ class SpineDBManager(QObject):
             item_type (str)
             db_map_data (dict): lists of dictionary items keyed by DiffDatabaseMapping
         """
-        if item_type == "parameter_value_list":
-            # When queried from database, parameter value lists come as individual list values.
-            # Here we collect the separate values into value lists.
-            for db_map, items in db_map_data.items():
-                cache = self._cache.setdefault(db_map, {}).setdefault(item_type, {})
-                for item in items:
-                    id_ = item["id"]
-                    if "value_list" in item:
-                        cache[id_] = CacheItem(**item)
-                    else:
-                        cache_item = cache.get(id_)
-                        if cache_item is None:
-                            cache[id_] = cache_item = CacheItem(id=id_, name=item["name"], commit_id=item["commit_id"])
-                            value_list = []
-                            _insert_value_to_expanding_list(value_list, item["value"], item["value_index"])
-                            cache_item["value_list"] = value_list
-                        else:
-                            _insert_value_to_expanding_list(
-                                cache_item["value_list"], item["value"], item["value_index"]
-                            )
-        else:
-            for db_map, items in db_map_data.items():
-                cache = self._cache.setdefault(db_map, {}).setdefault(item_type, {})
-                for item in items:
-                    cache[item["id"]] = CacheItem(**item)
+        for db_map, items in db_map_data.items():
+            cache = self._cache.setdefault(db_map, {}).setdefault(item_type, {})
+            for item in items:
+                cache[item["id"]] = CacheItem(**item)
 
     def _pop_item(self, db_map, item_type, id_):
         return self._cache.get(db_map, {}).get(item_type, {}).pop(id_, {})
@@ -906,24 +886,21 @@ class SpineDBManager(QObject):
             return parsed_value
         return None
 
-    def get_value_list_item(self, db_map, id_, index, role=Qt.DisplayRole):
+    def get_value_list_item(self, db_map, id_index, role=Qt.DisplayRole):
         """Returns one value item of a parameter_value_list.
 
         Args:
             db_map (DiffDatabaseMapping)
-            id_ (int): The parameter_value_list id
-            index (int): The value item index
+            id_index (str): The parameter_value_list id and index concatenated as it comes from the db
             role (int, optional)
         """
-        item = self.get_item(db_map, "parameter_value_list", id_)
+        item = self.get_item(db_map, "parameter_value_list", id_index)
         if not item:
             return None
-        value_list = _parsed_value_list(item)
-        if not (0 <= index < len(value_list)):
-            return None
+        value = from_database(item["value"])
         if role == Qt.EditRole:
-            return str(value_list[index])
-        return self._format_value(value_list[index], role)
+            return str(value)
+        return self._format_value(value, role)
 
     def get_parameter_value_list(self, db_map, id_, role=Qt.DisplayRole):
         """Returns a parameter_value_list formatted for the given role.

@@ -16,10 +16,9 @@ Tree items for parameter_value lists.
 :date:   28.6.2019
 """
 
-import json
 from PySide2.QtCore import Qt
 from PySide2.QtGui import QIcon
-from spinedb_api import to_database, from_database
+from spinedb_api import from_database
 from spinetoolbox.mvcmodels.shared import PARSED_ROLE
 from .tree_item_utility import (
     EmptyChildMixin,
@@ -28,6 +27,7 @@ from .tree_item_utility import (
     EditableMixin,
     StandardDBItem,
     FetchMoreMixin,
+    SortsChildrenMixin,
     LeafItem,
 )
 from ...helpers import CharIconEngine, rows_to_row_count_tuples
@@ -55,7 +55,7 @@ class DBItem(EmptyChildMixin, FetchMoreMixin, StandardDBItem):
             self.remove_children(row, count)
 
 
-class ListItem(GrayIfLastMixin, EditableMixin, EmptyChildMixin, BoldTextMixin, LeafItem):
+class ListItem(GrayIfLastMixin, EditableMixin, EmptyChildMixin, BoldTextMixin, SortsChildrenMixin, LeafItem):
     """A parameter value list item."""
 
     def __init__(self, identifier=None, name=None):
@@ -77,15 +77,6 @@ class ListItem(GrayIfLastMixin, EditableMixin, EmptyChildMixin, BoldTextMixin, L
         """
         return [child.data(0, PARSED_ROLE) for child in self._children[:-1]]
 
-    def _do_finalize(self):
-        if not self.id and not self._name:
-            return
-        super()._do_finalize()
-        children = [
-            ValueItem(self.id) for _ in range(self.db_mngr.get_parameter_value_list_length(self.db_map, self.id))
-        ]
-        self.append_children(children)
-
     # pylint: disable=no-self-use
     def empty_child(self):
         return ValueItem(self.id)
@@ -104,7 +95,7 @@ class ListItem(GrayIfLastMixin, EditableMixin, EmptyChildMixin, BoldTextMixin, L
             self.update_item_in_db(db_item)
             return True
         # Don't add item to db. Items are only added when the first list value is set.
-        # Instead, insert a wip list item with a just name, and no values yet
+        # Instead, insert a wip list item with just a name, and no values yet
         self.parent_item.insert_children(self.child_number(), [ListItem(name=value)])
         return True
 
@@ -125,6 +116,10 @@ class ListItem(GrayIfLastMixin, EditableMixin, EmptyChildMixin, BoldTextMixin, L
             removed_count = curr_value_count - value_count
             self.remove_children(value_count, removed_count)
 
+    @staticmethod
+    def _sort_key(child):
+        return int(child.id.split(",")[1])
+
 
 class ValueItem(GrayIfLastMixin, EditableMixin, LeafItem):
     @property
@@ -135,12 +130,17 @@ class ValueItem(GrayIfLastMixin, EditableMixin, LeafItem):
     def value(self):
         return self.db_mngr.get_value_list_item(self.db_map, self.id, self.child_number(), Qt.EditRole)
 
+    @property
+    def item_data(self):
+        if not self.id:
+            return self._make_item_data()
+        return self.db_mngr.get_item(self.db_map, self.parent_item.item_type, self.id)
+
     def data(self, column, role=Qt.DisplayRole):
         if role in (Qt.DisplayRole, Qt.EditRole, Qt.ToolTipRole, PARSED_ROLE):
-            value = self.db_mngr.get_value_list_item(self.db_map, self.id, self.child_number(), role)
-            if value is not None:
-                return value
-            return "Enter new list value here..." if role != PARSED_ROLE else None
+            if not self.id:
+                return "Enter new list value here..." if role != PARSED_ROLE else None
+            return self.db_mngr.get_value_list_item(self.db_map, self.id, role=role)
         return super().data(column, role)
 
     def _make_item_to_add(self, value):

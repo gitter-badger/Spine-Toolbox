@@ -18,23 +18,41 @@ A tree model for parameter_value lists.
 
 from PySide2.QtCore import Qt, QModelIndex
 from .tree_model_base import TreeModelBase
-from .parameter_value_list_item import DBItem, ListItem
+from .parameter_value_list_item import DBItem, ListItem, ValueItem
 
 
 class ParameterValueListModel(TreeModelBase):
     """A model to display parameter_value_list data in a tree view."""
 
+    def _get_db_item(self, db_map):
+        return {db_item.db_map: db_item for db_item in self._invisible_root_item.children}[db_map]
+
+    def _get_list_item(self, db_map, item):
+        id_, commit_id = item["id"], item["commit_id"]
+        db_item = self._get_db_item(db_map)
+        list_item = {x.id: x for x in db_item.non_empty_children}.get(id_)
+        if list_item is not None:
+            return list_item
+        list_item = ListItem(id_)
+        if commit_id is not None:
+            db_item.insert_children_sorted([list_item])
+        else:
+            db_item.insert_children(len(db_item.non_empty_children), [list_item])
+        return list_item
+
     def add_parameter_value_lists(self, db_map_data):
-        reduced = {}
+        db_map_wide_data = {}
         for db_map, data in db_map_data.items():
-            ids_only = {}
+            db_map_wide_data[db_map] = wide_data = {}
             for item in data:
-                id_ = item["id"]
-                ids_only[id_] = {"id": id_, "name": item["name"]}
-            reduced[db_map] = list(ids_only.values())
-        for db_item, items in self._items_per_db_item(reduced).items():
-            db_item.remove_wip_items({x["name"] for x in items})
-            self._insert_items(db_item, items, ListItem)
+                item = item.copy()
+                id_ = int(item["id"].split(",")[0])
+                wide_data.setdefault(id_, []).append(item)
+        for db_map, wide_data in db_map_wide_data.items():
+            for items in wide_data.values():
+                list_item = self._get_list_item(db_map, next(iter(items)))
+                children = [ValueItem(x["id"]) for x in items]
+                list_item.insert_children_sorted(children)
 
     def update_parameter_value_lists(self, db_map_data):
         for root_item, items in self._items_per_db_item(db_map_data).items():
