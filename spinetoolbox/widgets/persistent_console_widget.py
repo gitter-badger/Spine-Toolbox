@@ -9,6 +9,7 @@
 # this program. If not, see <http://www.gnu.org/licenses/>.
 ######################################################################################################################
 
+import os
 from enum import Enum, auto, unique
 from pygments.styles import get_style_by_name
 from pygments.lexers import get_lexer_by_name
@@ -16,7 +17,6 @@ from pygments.util import ClassNotFound
 from pygments.token import Token
 from PySide2.QtCore import Qt, QRunnable, QObject, Signal, QThreadPool, Slot, QTimer
 from PySide2.QtWidgets import (
-    QApplication,
     QListWidget,
     QListWidgetItem,
     QStyledItemDelegate,
@@ -261,16 +261,16 @@ class PersistentConsoleWidget(QListWidget):
         engine_server_address = self._toolbox.qsettings().value("appSettings/engineServerAddress", defaultValue="")
         engine_mngr = make_engine_manager(engine_server_address)
         completions = engine_mngr.get_persistent_completions(self._key, partial_text)
-        if len(completions) > 1:
-            # Multiple options: Print them to stdout and add new prompt
+        prefix = os.path.commonprefix(completions)
+        if partial_text.endswith(prefix):
+            # Can't complete: Add new fake prompt and print completions to stdout
             self.add_stdin(text)
-            QApplication.processEvents()
             self.add_stdout("\t\t".join(completions))
-        elif completions:
-            # Unique option: Autocomplet current line
+        else:
+            # Complete current line
             cursor = self._delegate.line_edit.textCursor()
             last_word = partial_text.split(" ")[-1]
-            cursor.insertText(completions[0][len(last_word) :])
+            cursor.insertText(prefix[len(last_word) :])
 
     @Slot()
     def _add_prompt(self):
