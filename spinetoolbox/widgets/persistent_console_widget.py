@@ -9,11 +9,12 @@
 # this program. If not, see <http://www.gnu.org/licenses/>.
 ######################################################################################################################
 
+from enum import Enum, auto, unique
 from pygments.styles import get_style_by_name
 from pygments.lexers import get_lexer_by_name
 from pygments.util import ClassNotFound
 from pygments.token import Token
-from PySide2.QtCore import Qt, QRunnable, QObject, Signal, QThreadPool, Slot, QPersistentModelIndex
+from PySide2.QtCore import Qt, QRunnable, QObject, Signal, QThreadPool, Slot, QTimer
 from PySide2.QtWidgets import (
     QApplication,
     QListWidget,
@@ -23,9 +24,10 @@ from PySide2.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPlainTextEdit,
+    QMenu,
 )
 from PySide2.QtGui import QFontDatabase, QColor, QFont, QTextDocument, QTextCursor, QTextCharFormat
-from spinetoolbox.helpers import CustomSyntaxHighlighter
+from spinetoolbox.helpers import CustomSyntaxHighlighter, keeping_at_bottom
 from spinetoolbox.spine_engine_manager import make_engine_manager
 
 
@@ -35,11 +37,16 @@ _FG_COLOR = _STYLE.styles[Token.Text]
 _STYLE_SHEET = f"{{background-color: {_BG_COLOR}; color: {_FG_COLOR}; border: 0px}}"
 
 
-class PromptLineEdit(QPlainTextEdit):
-    return_pressed = Signal(str)
+@unique
+class PromptType(Enum):
+    NORMAL = auto()
+    CONTINUATION = auto()
 
-    def __init__(self, parent=None):
-        super().__init__(parent=parent)
+
+class PromptLineEdit(QPlainTextEdit):
+    def __init__(self, console):
+        super().__init__()
+        self._console = console
         self.setFont(_font())
         self.setUndoRedoEnabled(False)
         self.document().setDocumentMargin(0)
@@ -56,6 +63,7 @@ class PromptLineEdit(QPlainTextEdit):
         line_count = self.document().size().height()
         height = line_count * self.fontMetrics().height()
         self.setFixedHeight(height)
+        self._console.scheduleDelayedItemsLayout()
 
     def _get_current_text(self):
         """Returns current text.
@@ -72,38 +80,35 @@ class PromptLineEdit(QPlainTextEdit):
     def keyPressEvent(self, ev):
         text, partial_text = self._get_current_text()
         if ev.key() in (Qt.Key_Return, Qt.Key_Enter):
-            self.return_pressed.emit(text)
+            self._console.issue_command(text)
             return
         if ev.key() == Qt.Key_Up:
-            # self.parent().move_history(text, 1)
+            self._console.move_history(text, 1)
             return
         if ev.key() == Qt.Key_Down:
-            # self.parent().move_history(text, -1)
+            self._console.move_history(text, -1)
             return
         if ev.key() == Qt.Key_Tab and partial_text.strip():
-            # self.parent().autocomplete(text, partial_text)
+            self._console.autocomplete(text, partial_text)
             return
         super().keyPressEvent(ev)
 
 
 class PromptDelegate(QStyledItemDelegate):
-    return_pressed = Signal(str)
-
     def __init__(self, language, parent=None):
         super().__init__(parent=parent)
+        self._parent = parent
         self._prompt, self._prompt_format = _make_prompt(language)
-        doc = QTextDocument()
-        doc.setDocumentMargin(0)
-        doc.setDefaultFont(_font())
-        cursor = QTextCursor(doc)
-        cursor.insertText(self._prompt, self._prompt_format)
-        self._formatted_prompt = doc.toHtml()
         self._cont_prompt = _make_cont_prompt(language)
+        self._font = _font()
+        self._formatted_prompt = _make_formatted_text(self._font, self._prompt, self._prompt_format)
+        self._formatted_cont_prompt = _make_formatted_text(self._font, self._cont_prompt, self._prompt_format)
         self._text_format = QTextCharFormat()
         self._text_format.setForeground(QColor(_FG_COLOR))
-        self.label = None
-        self.line_edit = None
-        self._highlighter = CustomSyntaxHighlighter(self)
+        self.label = QLabel(self._formatted_prompt)
+        self.label.setAlignment(Qt.AlignTop)
+        self.line_edit = PromptLineEdit(parent)
+        self._highlighter = CustomSyntaxHighlighter(self.line_edit.document())
         self._highlighter.set_style(_STYLE)
         try:
             self._highlighter.lexer = get_lexer_by_name(language)
@@ -113,11 +118,9 @@ class PromptDelegate(QStyledItemDelegate):
     def createEditor(self, parent, option, index):
         editor = QWidget(parent)
         layout = QHBoxLayout(editor)
-        self.label = QLabel(self._formatted_prompt, editor)
-        self.line_edit = PromptLineEdit(editor)
         self._highlighter.setDocument(self.line_edit.document())
-        self.line_edit.setFocus()
-        self.line_edit.return_pressed.connect(self.return_pressed)
+        self.line_edit.setParent(parent)
+        self.label.setParent(parent)
         layout.addWidget(self.label)
         layout.addWidget(self.line_edit)
         layout.setSpacing(0)
@@ -125,17 +128,36 @@ class PromptDelegate(QStyledItemDelegate):
         editor.setStyleSheet(f"QWidget {_STYLE_SHEET}")
         return editor
 
-    def paint(self, painter, option, index):
+    def update_prompt(self, is_complete):
+        self.label.setText(self._formatted_prompt if is_complete else self._formatted_cont_prompt)
+
+    def sizeHint(self, option, index):
+        if index.row() == index.model().rowCount() - 1:
+            return self.line_edit.size()
+        doc = _make_doc(self._font)
+        doc.setTextWidth(self._parent.viewport().width())
+        cursor = QTextCursor(doc)
         text = index.data(Qt.DisplayRole)
-        with_prompt = index.data(Qt.UserRole)
+        with_prompt = index.data(Qt.UserRole) is not None
+        if with_prompt:
+            text = self._prompt + text
+        cursor.insertText(text)
+        return doc.size().toSize()
+
+    def paint(self, painter, option, index):
+        if index.row() == index.model().rowCount() - 1:
+            text = self.line_edit.toPlainText()
+        else:
+            text = index.data(Qt.DisplayRole)
+        prompt_type = index.data(Qt.UserRole)
         if text is None:
             text = ""
-        doc = QTextDocument()
-        doc.setDocumentMargin(0)
-        doc.setDefaultFont(_font())
+        doc = _make_doc(self._font)
+        doc.setTextWidth(option.rect.width())
         cursor = QTextCursor(doc)
-        if with_prompt:
-            cursor.insertText(self._prompt, self._prompt_format)
+        if prompt_type is not None:
+            prompt = self._prompt if prompt_type == PromptType.NORMAL else self._cont_prompt
+            cursor.insertText(prompt, self._prompt_format)
             self._insert_formatted_text(cursor, text)
         else:
             cursor.insertText(text, self._text_format)
@@ -171,24 +193,26 @@ class PersistentConsoleWidget(QListWidget):
             owner (ProjectItemBase, optional): console owner
         """
         super().__init__(parent=toolbox)
-        self.setSpacing(2)
+        self.setFont(_font())
+        self.setSpacing(1)
         self._thread_pool = QThreadPool()
         self._toolbox = toolbox
         self._key = key
         self._language = language
         self.owners = {owner}
-        self._has_prompt = False
         self._history_index = 0
         self._history_item_zero = ""
+        self._awaiting_response = False
+        self._is_last_command_complete = True
         self.setStyleSheet(f"QListWidget {_STYLE_SHEET}")
-        self._line_edit_char_count = 0
         self._delegate = PromptDelegate(language, parent=self)
-        self._delegate.return_pressed.connect(self.issue_command)
-        self._prompt_index = None
         self.setItemDelegate(self._delegate)
         self._add_prompt()
-        self._items_buffer = []
-        self.startTimer(200)
+        self._text_buffer = []
+        self._timer = QTimer()
+        self._timer.setInterval(200)
+        self._timer.timeout.connect(self._drain_text_buffer)
+        self._timer.start()
 
     def name(self):
         """Returns console name for display purposes."""
@@ -200,6 +224,10 @@ class PersistentConsoleWidget(QListWidget):
 
     def focusInEvent(self, ev):
         self._delegate.line_edit.setFocus()
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        self.scheduleDelayedItemsLayout()
 
     def move_history(self, text, step):
         """Moves history.
@@ -218,10 +246,10 @@ class PersistentConsoleWidget(QListWidget):
             history_item = self._history_item_zero
         else:
             history_item = engine_mngr.get_persistent_history_item(self._key, self._history_index)
-        self._line_edit.setPlainText(history_item)
-        cursor = self._line_edit.textCursor()
+        self._delegate.line_edit.setPlainText(history_item)
+        cursor = self._delegate.line_edit.textCursor()
         cursor.movePosition(cursor.End)
-        self._line_edit.setTextCursor(cursor)
+        self._delegate.line_edit.setTextCursor(cursor)
 
     def autocomplete(self, text, partial_text):
         """Autocompletes current text in the prompt (or print options if multiple matches).
@@ -240,22 +268,17 @@ class PersistentConsoleWidget(QListWidget):
             self.add_stdout("\t\t".join(completions))
         elif completions:
             # Unique option: Autocomplet current line
-            cursor = self._line_edit.textCursor()
+            cursor = self._delegate.line_edit.textCursor()
             last_word = partial_text.split(" ")[-1]
             cursor.insertText(completions[0][len(last_word) :])
 
-    @Slot(bool)
-    def _add_prompt(self, is_complete=True):
+    @Slot()
+    def _add_prompt(self):
         """Adds a prompt at the end of the document."""
         item = QListWidgetItem(None)
         item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsEditable)
         self.addItem(item)
-        if self._prompt_index is not None:
-            self.closePersistentEditor(self._prompt_index)
-            self.itemFromIndex(self._prompt_index).setFlags(Qt.ItemIsEnabled)
-        self._prompt_index = QPersistentModelIndex(self.indexFromItem(item))
-        self.openPersistentEditor(self._prompt_index)
-        self._has_prompt = True
+        self.openPersistentEditor(self.indexFromItem(item))
         self._delegate.label.show()
 
     def issue_command(self, text):
@@ -266,25 +289,32 @@ class PersistentConsoleWidget(QListWidget):
         """
         engine_server_address = self._toolbox.qsettings().value("appSettings/engineServerAddress", defaultValue="")
         issuer = CommandIssuer(engine_server_address, self._key, text)
-        if not self._has_prompt:
-            issuer.stdin_msg.connect(self.add_stdin)
-        else:
-            issuer.finished.connect(self._add_prompt)
+        issuer.stdin_msg.connect(self.add_stdin)
+        issuer.stdin_msg.connect(self._delegate.line_edit.clear)
         issuer.stdout_msg.connect(self.add_stdout)
         issuer.stderr_msg.connect(self.add_stderr)
-        self._commit_line_edit(text)
+        issuer.finished.connect(self._handle_command_finished)
+        if self._awaiting_response:
+            self._print_delayed_command(text)
+        self._delegate.label.hide()
         self._history_index = 0
+        self._awaiting_response = True
         self._thread_pool.start(issuer)
 
-    def _commit_line_edit(self, text):
-        """Inserts given text and clears line edit."""
+    @Slot(bool)
+    def _handle_command_finished(self, is_complete):
+        self._awaiting_response = False
+        self._is_last_command_complete = is_complete
+        self._delegate.label.show()
+        self._delegate.update_prompt(is_complete)
+
+    def _print_delayed_command(self, text):
+        """Prints commands issued by the user while waiting for a response."""
+        self._delegate.line_edit.clear()
         item = QListWidgetItem(text)
         item.setFlags(Qt.ItemIsEnabled)
-        item.setData(Qt.UserRole, self._has_prompt)
-        self.insertItem(self.model().rowCount() - 1, item)
-        self._delegate.label.hide()
-        self._delegate.line_edit.clear()
-        self._has_prompt = False
+        with keeping_at_bottom(self):
+            self.insertItem(self.model().rowCount() - 1, item)
 
     def add_stdin(self, data):
         """Adds new prompt with data. Used when adding stdin from external execution.
@@ -292,6 +322,7 @@ class PersistentConsoleWidget(QListWidget):
         Args:
             data (str)
         """
+        # TODO: Check if last command is complete and if not, use a continuation prompt
         self._insert_text_before_prompt(data, with_prompt=True)
 
     @Slot(str)
@@ -320,34 +351,33 @@ class PersistentConsoleWidget(QListWidget):
         Args:
             text (str)
         """
-        self._items_buffer.append((text, with_prompt))
+        prompt_type = (
+            (PromptType.NORMAL if self._is_last_command_complete else PromptType.CONTINUATION) if with_prompt else None
+        )
+        self._text_buffer.append((text, prompt_type))
 
-    def timerEvent(self, ev):
+    @Slot()
+    def _drain_text_buffer(self):
         """Inserts all text from buffer."""
-        if not self._items_buffer:
+        if not self._text_buffer:
             return
-        scrollbar = self.verticalScrollBar()
-        at_bottom = scrollbar.value() == scrollbar.maximum()
-        row = self._prompt_index.row()
-        texts, with_prompts = zip(*self._items_buffer)
-        self.insertItems(row, texts)
-        # TODO: needed if we will implement text selection differently?
-        for i, with_prompt in enumerate(with_prompts):
+        row = self.model().rowCount() - 1
+        texts, prompt_types = zip(*self._text_buffer)
+        with keeping_at_bottom(self):
+            self.insertItems(row, texts)
+        for i, prompt_type in enumerate(prompt_types):
             item = self.item(row + i)
             item.setFlags(Qt.ItemIsEnabled)
-            item.setData(Qt.UserRole, with_prompt)
-        self._items_buffer = []
+            item.setData(Qt.UserRole, prompt_type)
+        self._text_buffer = []
         rows_to_remove = self.model().rowCount() - self._MAX_ROWS
         if rows_to_remove > 0:
             self.model().removeRows(0, rows_to_remove)
-        if at_bottom:
-            scrollbar.setValue(scrollbar.maximum())
 
     @Slot(bool)
     def _restart_persistent(self, _=False):
         """Restarts underlying persistent process."""
         self.clear()
-        self._line_edit.clear()
         engine_server_address = self._toolbox.qsettings().value("appSettings/engineServerAddress", defaultValue="")
         restarter = Restarter(engine_server_address, self._key)
         restarter.finished.connect(self._add_prompt)
@@ -368,7 +398,7 @@ class PersistentConsoleWidget(QListWidget):
 
     def contextMenuEvent(self, event):
         """Reimplemented to extend menu with custom actions."""
-        menu = self.createStandardContextMenu()
+        menu = QMenu()
         self._extend_menu(menu)
         menu.exec_(event.globalPos())
 
@@ -469,3 +499,17 @@ def _make_cont_prompt(language):
     else:
         prompt = "  "
     return prompt
+
+
+def _make_doc(font):
+    doc = QTextDocument()
+    doc.setDocumentMargin(0)
+    doc.setDefaultFont(font)
+    return doc
+
+
+def _make_formatted_text(font, text, format_):
+    doc = _make_doc(font)
+    cursor = QTextCursor(doc)
+    cursor.insertText(text, format_)
+    return doc.toHtml()

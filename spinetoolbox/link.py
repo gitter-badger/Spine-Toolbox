@@ -187,7 +187,7 @@ class LinkBase(QGraphicsPathItem):
         Returns:
             QPainterPath
         """
-        c_factor = min(4.5 * self.magic_number, (self.src_center - self.dst_center).manhattanLength() / 4)
+        c_factor = min(4 * self.magic_number, (self.src_center - self.dst_center).manhattanLength() / 4)
         src = self.src_center + c_factor * self._get_src_offset()
         dst = self.dst_center + c_factor * self._get_dst_offset()
         src_points = [self.src_center, src]

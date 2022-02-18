@@ -1481,3 +1481,15 @@ def merge_dicts(source, target):
 def fix_lightness_color(color, lightness=240):
     h, s, _, a = color.getHsl()
     return QColor.fromHsl(h, s, lightness, a)
+
+
+@contextmanager
+def keeping_at_bottom(scroll_area):
+    """A context manager to keep a scroll area at bottom."""
+    scrollbar = scroll_area.verticalScrollBar()
+    at_bottom = scrollbar.value() in (scrollbar.maximum(), 0)
+    try:
+        yield None
+    finally:
+        if at_bottom:
+            scrollbar.setValue(scrollbar.maximum())
