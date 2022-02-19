@@ -273,11 +273,11 @@ class SpineEngineWorker(QObject):
             )
             self._event_message_arrived.emit(item, msg["filter_id"], "msg_error", msg_text)
         elif msg_type == "stdin":
-            item.persistent_stdin_available.emit(msg["filter_id"], msg["data"])
+            item.add_persistent_stdin(msg["filter_id"], msg["data"])
         elif msg_type == "stdout":
-            item.persistent_stdout_available.emit(msg["filter_id"], msg["data"])
+            item.add_persistent_stdout(msg["filter_id"], msg["data"])
         elif msg_type == "stderr":
-            item.persistent_stderr_available.emit(msg["filter_id"], msg["data"])
+            item.add_persistent_stderr(msg["filter_id"], msg["data"])
         elif msg_type == "execution_started":
             self._event_message_arrived.emit(
                 item, msg["filter_id"], "msg", f"*** Starting execution on persistent process <b>{msg['args']}</b> ***"
@@ -287,7 +287,7 @@ class SpineEngineWorker(QObject):
     def _handle_kernel_execution_msg(self, msg):
         item = self._project_items[msg["item_name"]]
         if msg["type"] == "kernel_started":
-            item.jupyter_console_requested.emit(msg["filter_id"], msg["kernel_name"], msg["connection_file"])
+            item.setup_jupyter_console(msg["filter_id"], msg["kernel_name"], msg["connection_file"])
         elif msg["type"] == "kernel_spec_not_found":
             msg_text = (
                 f"Unable to find kernel spec <b>{msg['kernel_name']}</b>"

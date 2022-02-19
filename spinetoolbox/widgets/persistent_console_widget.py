@@ -15,7 +15,7 @@ from pygments.styles import get_style_by_name
 from pygments.lexers import get_lexer_by_name
 from pygments.util import ClassNotFound
 from pygments.token import Token
-from PySide2.QtCore import Qt, QRunnable, QObject, Signal, QThreadPool, Slot, QTimer
+from PySide2.QtCore import Qt, QRunnable, QThreadPool, Slot, QTimer, QPoint, QMutex
 from PySide2.QtWidgets import (
     QListWidget,
     QListWidgetItem,
@@ -26,13 +26,22 @@ from PySide2.QtWidgets import (
     QPlainTextEdit,
     QMenu,
 )
-from PySide2.QtGui import QFontDatabase, QColor, QFont, QTextDocument, QTextCursor, QTextCharFormat
+from PySide2.QtGui import (
+    QFontDatabase,
+    QColor,
+    QFont,
+    QTextDocument,
+    QTextCursor,
+    QTextCharFormat,
+    QFontMetrics,
+)
 from spinetoolbox.helpers import CustomSyntaxHighlighter, keeping_at_bottom
 from spinetoolbox.spine_engine_manager import make_engine_manager
 
 
 _STYLE = get_style_by_name("monokai")
 _BG_COLOR = _STYLE.background_color
+_HL_COLOR = _STYLE.highlight_color
 _FG_COLOR = _STYLE.styles[Token.Text]
 _STYLE_SHEET = f"{{background-color: {_BG_COLOR}; color: {_FG_COLOR}; border: 0px}}"
 
@@ -95,9 +104,9 @@ class PromptLineEdit(QPlainTextEdit):
 
 
 class PromptDelegate(QStyledItemDelegate):
-    def __init__(self, language, parent=None):
-        super().__init__(parent=parent)
-        self._parent = parent
+    def __init__(self, language, console):
+        super().__init__(parent=console)
+        self._console = console
         self._prompt, self._prompt_format = _make_prompt(language)
         self._cont_prompt = _make_cont_prompt(language)
         self._font = _font()
@@ -107,7 +116,7 @@ class PromptDelegate(QStyledItemDelegate):
         self._text_format.setForeground(QColor(_FG_COLOR))
         self.label = QLabel(self._formatted_prompt)
         self.label.setAlignment(Qt.AlignTop)
-        self.line_edit = PromptLineEdit(parent)
+        self.line_edit = PromptLineEdit(console)
         self._highlighter = CustomSyntaxHighlighter(self.line_edit.document())
         self._highlighter.set_style(_STYLE)
         try:
@@ -135,7 +144,7 @@ class PromptDelegate(QStyledItemDelegate):
         if index.row() == index.model().rowCount() - 1:
             return self.line_edit.size()
         doc = _make_doc(self._font)
-        doc.setTextWidth(self._parent.viewport().width())
+        doc.setTextWidth(self._console.viewport().width())
         cursor = QTextCursor(doc)
         text = index.data(Qt.DisplayRole)
         with_prompt = index.data(Qt.UserRole) is not None
@@ -161,10 +170,34 @@ class PromptDelegate(QStyledItemDelegate):
             self._insert_formatted_text(cursor, text)
         else:
             cursor.insertText(text, self._text_format)
+        if index.row() < index.model().rowCount() - 1:
+            self._paint_selection(painter, option, doc)
         painter.save()
         painter.translate(option.rect.topLeft())
         doc.drawContents(painter)
         painter.restore()
+
+    def _paint_selection(self, painter, option, doc):
+        rect = option.rect.adjusted(0, -self._console.spacing(), 0, self._console.spacing())
+        # if selection starts below the index, we leave
+        if self._console.selection_begin.y() >= rect.bottom():
+            return
+        # if selection ends above the index, we also leave
+        if self._console.selection_end.y() <= rect.top():
+            return
+        char_width = QFontMetrics(self._font).averageCharWidth()
+        text_width = (doc.characterCount() - 1) * char_width
+        # if selection starts at the index, set left
+        if rect.top() < self._console.selection_begin.y() < rect.bottom():
+            left = char_width * (self._console.selection_begin.x() // char_width)
+            if left <= text_width:
+                rect.setLeft(left)
+        # if selection ends at the index, set right
+        if rect.top() < self._console.selection_end.y() < rect.bottom():
+            right = char_width * (self._console.selection_end.x() // char_width)
+            if right <= text_width:
+                rect.setRight(right)
+        painter.fillRect(rect, QColor(_HL_COLOR))
 
     def _insert_formatted_text(self, cursor, text):
         """Inserts formatted text.
@@ -194,25 +227,64 @@ class PersistentConsoleWidget(QListWidget):
         """
         super().__init__(parent=toolbox)
         self.setFont(_font())
+        self.setCursor(Qt.IBeamCursor)
         self.setSpacing(1)
-        self._thread_pool = QThreadPool()
+        self.setStyleSheet(f"QListWidget {_STYLE_SHEET}")
         self._toolbox = toolbox
+        self._thread_pool = QThreadPool()
         self._key = key
         self._language = language
         self.owners = {owner}
         self._history_index = 0
         self._history_item_zero = ""
-        self._awaiting_response = False
+        self._pending_command_count = 0
         self._is_last_command_complete = True
-        self.setStyleSheet(f"QListWidget {_STYLE_SHEET}")
-        self._delegate = PromptDelegate(language, parent=self)
+        self._delegate = PromptDelegate(language, self)
         self.setItemDelegate(self._delegate)
         self._add_prompt()
         self._text_buffer = []
+        self._mutex = QMutex()
         self._timer = QTimer()
         self._timer.setInterval(200)
         self._timer.timeout.connect(self._drain_text_buffer)
         self._timer.start()
+        self._press_pos = QPoint()
+        self._move_pos = QPoint()
+        self.selection_begin = QPoint()
+        self.selection_end = QPoint()
+
+    def mousePressEvent(self, ev):
+        super().mousePressEvent(ev)
+        if ev.button() != Qt.LeftButton:
+            return
+        self._press_pos = self._move_pos = ev.pos() if self.indexAt(ev.pos()).isValid() else QPoint()
+        self._recompute_selection()
+
+    def mouseMoveEvent(self, ev):
+        super().mouseMoveEvent(ev)
+        if not self.indexAt(ev.pos()).isValid():
+            return
+        if self._press_pos.isNull():
+            self._press_pos = ev.pos()
+        self._move_pos = ev.pos()
+        self._recompute_selection()
+
+    def _recompute_selection(self):
+        press_x = self._press_pos.x()
+        move_x = self._move_pos.x()
+        press_row = self.indexAt(self._press_pos).row()
+        move_row = self.indexAt(self._move_pos).row()
+        same_row = press_row == move_row
+        left_to_right = press_x < move_x
+        top_to_bottom = press_row < move_row
+        forward = left_to_right if same_row else top_to_bottom
+        if forward:
+            self.selection_begin = self._press_pos
+            self.selection_end = self._move_pos
+        else:
+            self.selection_begin = self._move_pos
+            self.selection_end = self._press_pos
+        self.scheduleDelayedItemsLayout()
 
     def name(self):
         """Returns console name for display purposes."""
@@ -263,16 +335,15 @@ class PersistentConsoleWidget(QListWidget):
         completions = engine_mngr.get_persistent_completions(self._key, partial_text)
         prefix = os.path.commonprefix(completions)
         if partial_text.endswith(prefix):
-            # Can't complete: Add new fake prompt and print completions to stdout
+            # Can't complete: 'commit' stdin and print options to stdout
             self.add_stdin(text)
             self.add_stdout("\t\t".join(completions))
         else:
-            # Complete current line
+            # Complete in current line
             cursor = self._delegate.line_edit.textCursor()
             last_word = partial_text.split(" ")[-1]
             cursor.insertText(prefix[len(last_word) :])
 
-    @Slot()
     def _add_prompt(self):
         """Adds a prompt at the end of the document."""
         item = QListWidgetItem(None)
@@ -288,33 +359,39 @@ class PersistentConsoleWidget(QListWidget):
             text (str)
         """
         engine_server_address = self._toolbox.qsettings().value("appSettings/engineServerAddress", defaultValue="")
-        issuer = CommandIssuer(engine_server_address, self._key, text)
-        issuer.stdin_msg.connect(self.add_stdin)
-        issuer.stdin_msg.connect(self._delegate.line_edit.clear)
+        issuer = CommandIssuer(engine_server_address, self._key, text, self._mutex)
         issuer.stdout_msg.connect(self.add_stdout)
         issuer.stderr_msg.connect(self.add_stderr)
         issuer.finished.connect(self._handle_command_finished)
-        if self._awaiting_response:
-            self._print_delayed_command(text)
+        if self._pending_command_count:
+            issuer.stdin_msg.connect(self.add_stdin)
+        self._print_command(text, with_prompt=not self._pending_command_count)
+        self._delegate.line_edit.clear()
         self._delegate.label.hide()
         self._history_index = 0
-        self._awaiting_response = True
+        self._pending_command_count += 1
         self._thread_pool.start(issuer)
 
-    @Slot(bool)
+    def _get_prompt_type(self, with_prompt):
+        if not with_prompt:
+            return None
+        if self._is_last_command_complete:
+            return PromptType.NORMAL
+        return PromptType.CONTINUATION
+
+    def _print_command(self, text, with_prompt):
+        item = QListWidgetItem(text)
+        item.setFlags(Qt.ItemIsEnabled)
+        prompt_type = self._get_prompt_type(with_prompt)
+        item.setData(Qt.UserRole, prompt_type)
+        with keeping_at_bottom(self):
+            self.insertItem(self.model().rowCount() - 1, item)
+
     def _handle_command_finished(self, is_complete):
-        self._awaiting_response = False
+        self._pending_command_count -= 1
         self._is_last_command_complete = is_complete
         self._delegate.label.show()
         self._delegate.update_prompt(is_complete)
-
-    def _print_delayed_command(self, text):
-        """Prints commands issued by the user while waiting for a response."""
-        self._delegate.line_edit.clear()
-        item = QListWidgetItem(text)
-        item.setFlags(Qt.ItemIsEnabled)
-        with keeping_at_bottom(self):
-            self.insertItem(self.model().rowCount() - 1, item)
 
     def add_stdin(self, data):
         """Adds new prompt with data. Used when adding stdin from external execution.
@@ -322,10 +399,8 @@ class PersistentConsoleWidget(QListWidget):
         Args:
             data (str)
         """
-        # TODO: Check if last command is complete and if not, use a continuation prompt
         self._insert_text_before_prompt(data, with_prompt=True)
 
-    @Slot(str)
     def add_stdout(self, data):
         """Adds new line to stdout. Used when adding stdout from external execution.
 
@@ -334,7 +409,6 @@ class PersistentConsoleWidget(QListWidget):
         """
         self._insert_text_before_prompt(data)
 
-    @Slot(str)
     def add_stderr(self, data):
         """Adds new line to stderr. Used when adding stderr from external execution.
 
@@ -351,9 +425,7 @@ class PersistentConsoleWidget(QListWidget):
         Args:
             text (str)
         """
-        prompt_type = (
-            (PromptType.NORMAL if self._is_last_command_complete else PromptType.CONTINUATION) if with_prompt else None
-        )
+        prompt_type = self._get_prompt_type(with_prompt)
         self._text_buffer.append((text, prompt_type))
 
     @Slot()
@@ -363,27 +435,24 @@ class PersistentConsoleWidget(QListWidget):
             return
         row = self.model().rowCount() - 1
         texts, prompt_types = zip(*self._text_buffer)
+        self._text_buffer = []
         with keeping_at_bottom(self):
             self.insertItems(row, texts)
         for i, prompt_type in enumerate(prompt_types):
             item = self.item(row + i)
             item.setFlags(Qt.ItemIsEnabled)
             item.setData(Qt.UserRole, prompt_type)
-        self._text_buffer = []
         rows_to_remove = self.model().rowCount() - self._MAX_ROWS
         if rows_to_remove > 0:
             self.model().removeRows(0, rows_to_remove)
 
-    @Slot(bool)
     def _restart_persistent(self, _=False):
         """Restarts underlying persistent process."""
-        self.clear()
+        self.model().removeRows(0, self.model().rowCount() - 1)
         engine_server_address = self._toolbox.qsettings().value("appSettings/engineServerAddress", defaultValue="")
         restarter = Restarter(engine_server_address, self._key)
-        restarter.finished.connect(self._add_prompt)
         self._thread_pool.start(restarter)
 
-    @Slot(bool)
     def _interrupt_persistent(self, _=False):
         """Interrupts underlying persistent process."""
         engine_server_address = self._toolbox.qsettings().value("appSettings/engineServerAddress", defaultValue="")
@@ -403,11 +472,20 @@ class PersistentConsoleWidget(QListWidget):
         menu.exec_(event.globalPos())
 
 
+class _Signal:
+    def __init__(self):
+        self._slots = []
+
+    def connect(self, slot):
+        self._slots.append(slot)
+
+    def emit(self, *args, **kwargs):
+        for slot in self._slots:
+            slot(*args, **kwargs)
+
+
 class PersistentRunnableBase(QRunnable):
     """Base class for runnables that talk to the persistent process in another QThread."""
-
-    class Signals(QObject):
-        finished = Signal()
 
     def __init__(self, engine_server_address, persistent_key):
         """
@@ -418,8 +496,7 @@ class PersistentRunnableBase(QRunnable):
         super().__init__()
         self._persistent_key = persistent_key
         self._engine_mngr = make_engine_manager(engine_server_address)
-        self._signals = self.Signals()
-        self.finished = self._signals.finished
+        self.finished = _Signal()
 
 
 class Restarter(PersistentRunnableBase):
@@ -441,13 +518,7 @@ class Interrupter(PersistentRunnableBase):
 class CommandIssuer(PersistentRunnableBase):
     """A runnable that issues a command."""
 
-    class Signals(QObject):
-        finished = Signal(bool)
-        stdin_msg = Signal(str)
-        stdout_msg = Signal(str)
-        stderr_msg = Signal(str)
-
-    def __init__(self, engine_server_address, persistent_key, command):
+    def __init__(self, engine_server_address, persistent_key, command, mutex):
         """
         Args:
             engine_server_address (str): address of the remote engine, currently should always be an empty string
@@ -456,11 +527,13 @@ class CommandIssuer(PersistentRunnableBase):
         """
         super().__init__(engine_server_address, persistent_key)
         self._command = command
-        self.stdin_msg = self._signals.stdin_msg
-        self.stdout_msg = self._signals.stdout_msg
-        self.stderr_msg = self._signals.stderr_msg
+        self._mutex = mutex
+        self.stdin_msg = _Signal()
+        self.stdout_msg = _Signal()
+        self.stderr_msg = _Signal()
 
     def run(self):
+        self._mutex.lock()
         for msg in self._engine_mngr.issue_persistent_command(self._persistent_key, self._command):
             msg_type = msg["type"]
             if msg_type == "stdin":
@@ -472,6 +545,7 @@ class CommandIssuer(PersistentRunnableBase):
             elif msg_type == "command_finished":
                 self.finished.emit(msg["is_complete"])
                 break
+        self._mutex.unlock()
 
 
 def _font():
