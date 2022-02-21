@@ -24,6 +24,7 @@ from PySide2.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPlainTextEdit,
+    QTextEdit,
     QMenu,
 )
 from PySide2.QtGui import (
@@ -33,17 +34,17 @@ from PySide2.QtGui import (
     QTextDocument,
     QTextCursor,
     QTextCharFormat,
-    QFontMetrics,
 )
 from spinetoolbox.helpers import CustomSyntaxHighlighter, keeping_at_bottom
 from spinetoolbox.spine_engine_manager import make_engine_manager
 
+_PROMPT_ROLE = Qt.UserRole + 1
+_SELECTION_ROLE = Qt.UserRole + 2
 
 _STYLE = get_style_by_name("monokai")
 _BG_COLOR = _STYLE.background_color
 _HL_COLOR = _STYLE.highlight_color
 _FG_COLOR = _STYLE.styles[Token.Text]
-_STYLE_SHEET = f"{{background-color: {_BG_COLOR}; color: {_FG_COLOR}; border: 0px}}"
 
 
 @unique
@@ -56,23 +57,12 @@ class PromptLineEdit(QPlainTextEdit):
     def __init__(self, console):
         super().__init__()
         self._console = console
-        self.setFont(_font())
         self.setUndoRedoEnabled(False)
-        self.document().setDocumentMargin(0)
-        self.setFixedHeight(self.fontMetrics().height())
-        cursor_width = self.fontMetrics().horizontalAdvance("x")
-        self.setCursorWidth(cursor_width)
-        self.setTabStopDistance(4 * cursor_width)
+        self.setCursorWidth(0)
+        char_width = self.fontMetrics().horizontalAdvance("x")
+        self.setTabStopDistance(4 * char_width)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.textChanged.connect(self._adjust_size)
-
-    @Slot()
-    def _adjust_size(self):
-        line_count = self.document().size().height()
-        height = line_count * self.fontMetrics().height()
-        self.setFixedHeight(height)
-        self._console.scheduleDelayedItemsLayout()
 
     def _get_current_text(self):
         """Returns current text.
@@ -107,62 +97,48 @@ class PromptDelegate(QStyledItemDelegate):
     def __init__(self, language, console):
         super().__init__(parent=console)
         self._console = console
+        self._prompt_type = None
         self._prompt, self._prompt_format = _make_prompt(language)
         self._cont_prompt = _make_cont_prompt(language)
         self._font = _font()
-        self._formatted_prompt = _make_formatted_text(self._font, self._prompt, self._prompt_format)
-        self._formatted_cont_prompt = _make_formatted_text(self._font, self._cont_prompt, self._prompt_format)
         self._text_format = QTextCharFormat()
         self._text_format.setForeground(QColor(_FG_COLOR))
-        self.label = QLabel(self._formatted_prompt)
-        self.label.setAlignment(Qt.AlignTop)
+        self.label = QLabel()
+        self.label.setFont(self._font)
         self.line_edit = PromptLineEdit(console)
-        self._highlighter = CustomSyntaxHighlighter(self.line_edit.document())
-        self._highlighter.set_style(_STYLE)
-        try:
-            self._highlighter.lexer = get_lexer_by_name(language)
-        except ClassNotFound:
-            pass
+        self._highlighter = _make_highlighter(language)
+        self.update_prompt_type(PromptType.NORMAL)
+
+    @property
+    def prompt(self):
+        return self._prompt
 
     def createEditor(self, parent, option, index):
         editor = QWidget(parent)
         layout = QHBoxLayout(editor)
-        self._highlighter.setDocument(self.line_edit.document())
-        self.line_edit.setParent(parent)
-        self.label.setParent(parent)
         layout.addWidget(self.label)
         layout.addWidget(self.line_edit)
         layout.setSpacing(0)
         layout.setContentsMargins(0, 0, 0, 0)
-        editor.setStyleSheet(f"QWidget {_STYLE_SHEET}")
+        editor.setStyleSheet("background-color: transparent; color:transparent; border: 0px")
+        editor.setAttribute(Qt.WA_TransparentForMouseEvents)
         return editor
 
-    def update_prompt(self, is_complete):
-        self.label.setText(self._formatted_prompt if is_complete else self._formatted_cont_prompt)
+    def update_prompt_type(self, prompt_type):
+        self._prompt_type = prompt_type
+        text = {PromptType.NORMAL: self._prompt, PromptType.CONTINUATION: self._cont_prompt}.get(self._prompt_type, "")
+        self.label.setText(text)
 
-    def sizeHint(self, option, index):
+    def make_doc(self, index):
         if index.row() == index.model().rowCount() - 1:
-            return self.line_edit.size()
-        doc = _make_doc(self._font)
-        doc.setTextWidth(self._console.viewport().width())
-        cursor = QTextCursor(doc)
-        text = index.data(Qt.DisplayRole)
-        with_prompt = index.data(Qt.UserRole) is not None
-        if with_prompt:
-            text = self._prompt + text
-        cursor.insertText(text)
-        return doc.size().toSize()
-
-    def paint(self, painter, option, index):
-        if index.row() == index.model().rowCount() - 1:
-            text = self.line_edit.toPlainText()
+            text = self.line_edit.toPlainText() + "\u2588"
+            prompt_type = self._prompt_type
         else:
             text = index.data(Qt.DisplayRole)
-        prompt_type = index.data(Qt.UserRole)
+            prompt_type = index.data(_PROMPT_ROLE)
         if text is None:
             text = ""
         doc = _make_doc(self._font)
-        doc.setTextWidth(option.rect.width())
         cursor = QTextCursor(doc)
         if prompt_type is not None:
             prompt = self._prompt if prompt_type == PromptType.NORMAL else self._cont_prompt
@@ -170,34 +146,24 @@ class PromptDelegate(QStyledItemDelegate):
             self._insert_formatted_text(cursor, text)
         else:
             cursor.insertText(text, self._text_format)
-        if index.row() < index.model().rowCount() - 1:
-            self._paint_selection(painter, option, doc)
+        return doc
+
+    def sizeHint(self, option, index):
+        doc = self.make_doc(index)
+        doc.setTextWidth(self._console.viewport().width())
+        return doc.size().toSize()
+
+    def paint(self, painter, option, index):
+        doc = self.make_doc(index)
+        text_edit = QTextEdit()
+        text_edit.setStyleSheet("background-color: transparent; border: 0px")
+        text_edit.setDocument(doc)
+        text_edit.setFixedSize(option.rect.size())
+        _select(text_edit, index)
         painter.save()
         painter.translate(option.rect.topLeft())
-        doc.drawContents(painter)
+        text_edit.render(painter, QPoint(0, 0))
         painter.restore()
-
-    def _paint_selection(self, painter, option, doc):
-        rect = option.rect.adjusted(0, -self._console.spacing(), 0, self._console.spacing())
-        # if selection starts below the index, we leave
-        if self._console.selection_begin.y() >= rect.bottom():
-            return
-        # if selection ends above the index, we also leave
-        if self._console.selection_end.y() <= rect.top():
-            return
-        char_width = QFontMetrics(self._font).averageCharWidth()
-        text_width = (doc.characterCount() - 1) * char_width
-        # if selection starts at the index, set left
-        if rect.top() < self._console.selection_begin.y() < rect.bottom():
-            left = char_width * (self._console.selection_begin.x() // char_width)
-            if left <= text_width:
-                rect.setLeft(left)
-        # if selection ends at the index, set right
-        if rect.top() < self._console.selection_end.y() < rect.bottom():
-            right = char_width * (self._console.selection_end.x() // char_width)
-            if right <= text_width:
-                rect.setRight(right)
-        painter.fillRect(rect, QColor(_HL_COLOR))
 
     def _insert_formatted_text(self, cursor, text):
         """Inserts formatted text.
@@ -226,10 +192,9 @@ class PersistentConsoleWidget(QListWidget):
             owner (ProjectItemBase, optional): console owner
         """
         super().__init__(parent=toolbox)
-        self.setFont(_font())
         self.setCursor(Qt.IBeamCursor)
         self.setSpacing(1)
-        self.setStyleSheet(f"QListWidget {_STYLE_SHEET}")
+        self.setStyleSheet(f"QListWidget{{background-color: {_BG_COLOR}; border: 0px}}")
         self._toolbox = toolbox
         self._thread_pool = QThreadPool()
         self._key = key
@@ -248,43 +213,86 @@ class PersistentConsoleWidget(QListWidget):
         self._timer.setInterval(200)
         self._timer.timeout.connect(self._drain_text_buffer)
         self._timer.start()
-        self._press_pos = QPoint()
-        self._move_pos = QPoint()
-        self.selection_begin = QPoint()
-        self.selection_end = QPoint()
+        self._press_row_column = None
+        self._move_row_column = None
+        self._current_row = None
+        self._can_copy = False
 
     def mousePressEvent(self, ev):
         super().mousePressEvent(ev)
         if ev.button() != Qt.LeftButton:
             return
-        self._press_pos = self._move_pos = ev.pos() if self.indexAt(ev.pos()).isValid() else QPoint()
+        for row in range(self.model().rowCount()):
+            self.item(row).setData(_SELECTION_ROLE, None)
+        if not self.indexAt(ev.pos()).isValid():
+            self._press_row_column = None
+            return
+        self._press_row_column = self._move_row_column = self._current_row, _ = self._row_and_column_at(ev.pos())
         self._recompute_selection()
 
     def mouseMoveEvent(self, ev):
         super().mouseMoveEvent(ev)
         if not self.indexAt(ev.pos()).isValid():
             return
-        if self._press_pos.isNull():
-            self._press_pos = ev.pos()
-        self._move_pos = ev.pos()
+        self._move_row_column = self._row_and_column_at(ev.pos())
+        if self._press_row_column is None:
+            self._press_row_column = self._current_row, _ = self._move_row_column
         self._recompute_selection()
 
+    def _row_and_column_at(self, pos):
+        index = self.indexAt(pos)
+        doc = self._delegate.make_doc(index)
+        doc.setTextWidth(self.viewport().width())
+        pos -= self.visualRect(index).topLeft()
+        return index.row(), doc.documentLayout().hitTest(pos, Qt.FuzzyHit)
+
     def _recompute_selection(self):
-        press_x = self._press_pos.x()
-        move_x = self._move_pos.x()
-        press_row = self.indexAt(self._press_pos).row()
-        move_row = self.indexAt(self._move_pos).row()
-        same_row = press_row == move_row
-        left_to_right = press_x < move_x
-        top_to_bottom = press_row < move_row
-        forward = left_to_right if same_row else top_to_bottom
-        if forward:
-            self.selection_begin = self._press_pos
-            self.selection_end = self._move_pos
+        press_row, press_column = self._press_row_column
+        move_row, move_column = self._move_row_column
+        # Move current row, selecting or deselecting as needed
+        step = 1 if move_row > self._current_row else -1
+        while self._current_row != move_row:
+            next_row = self._current_row + step
+            # If we are moving to a row that is not selected, it means we are extending the selection.
+            # Otherwise we are shrinking it
+            extending_selection = self.item(next_row).data(_SELECTION_ROLE) is None
+            # If we are extending, then the current row (the one we are leaving) should become fully selected.
+            # Otherwise it should become fully deselected
+            self.item(self._current_row).setData(_SELECTION_ROLE, (None, None) if extending_selection else None)
+            self._current_row = next_row
+        # Set partial selections in first and last rows
+        _set_data = lambda item, role, value: item.setData(role, value) if item is not None else None
+        if press_row < move_row:
+            _set_data(self.item(press_row), _SELECTION_ROLE, (press_column, None))
+            _set_data(self.item(move_row), _SELECTION_ROLE, (None, move_column))
+        elif move_row < press_row:
+            _set_data(self.item(move_row), _SELECTION_ROLE, (move_column, None))
+            _set_data(self.item(press_row), _SELECTION_ROLE, (None, press_column))
         else:
-            self.selection_begin = self._move_pos
-            self.selection_end = self._press_pos
+            left, right = min(press_column, move_column), max(press_column, move_column)
+            _set_data(self.item(press_row), _SELECTION_ROLE, (left, right))
+        self._can_copy = press_row != move_row or press_column != move_column
         self.scheduleDelayedItemsLayout()
+
+    def copy(self):
+        lines = []
+        append_line = lines.append
+        for row in range(self.model().rowCount() - 1):
+            text = self.item(row).data(Qt.DisplayRole)
+            if self.item(row).data(_PROMPT_ROLE) is not None:
+                text = self._delegate.prompt + text
+            if not text:
+                continue
+            selection = self.item(row).data(_SELECTION_ROLE)
+            if selection is None:
+                continue
+            start, end = selection
+            start = 0 if start is None else start
+            if end is None:
+                append_line(text[start:])
+            else:
+                append_line(text[start:end])
+        qApp.clipboard().setText("\n".join(lines))  # pylint: disable=undefined-variable
 
     def name(self):
         """Returns console name for display purposes."""
@@ -359,7 +367,7 @@ class PersistentConsoleWidget(QListWidget):
             text (str)
         """
         engine_server_address = self._toolbox.qsettings().value("appSettings/engineServerAddress", defaultValue="")
-        issuer = CommandIssuer(engine_server_address, self._key, text, self._mutex)
+        issuer = CommandIssuer(engine_server_address, self._key, text)
         issuer.stdout_msg.connect(self.add_stdout)
         issuer.stderr_msg.connect(self.add_stderr)
         issuer.finished.connect(self._handle_command_finished)
@@ -383,7 +391,7 @@ class PersistentConsoleWidget(QListWidget):
         item = QListWidgetItem(text)
         item.setFlags(Qt.ItemIsEnabled)
         prompt_type = self._get_prompt_type(with_prompt)
-        item.setData(Qt.UserRole, prompt_type)
+        item.setData(_PROMPT_ROLE, prompt_type)
         with keeping_at_bottom(self):
             self.insertItem(self.model().rowCount() - 1, item)
 
@@ -391,7 +399,7 @@ class PersistentConsoleWidget(QListWidget):
         self._pending_command_count -= 1
         self._is_last_command_complete = is_complete
         self._delegate.label.show()
-        self._delegate.update_prompt(is_complete)
+        self._delegate.update_prompt_type(PromptType.NORMAL if is_complete else PromptType.CONTINUATION)
 
     def add_stdin(self, data):
         """Adds new prompt with data. Used when adding stdin from external execution.
@@ -441,7 +449,7 @@ class PersistentConsoleWidget(QListWidget):
         for i, prompt_type in enumerate(prompt_types):
             item = self.item(row + i)
             item.setFlags(Qt.ItemIsEnabled)
-            item.setData(Qt.UserRole, prompt_type)
+            item.setData(_PROMPT_ROLE, prompt_type)
         rows_to_remove = self.model().rowCount() - self._MAX_ROWS
         if rows_to_remove > 0:
             self.model().removeRows(0, rows_to_remove)
@@ -461,6 +469,8 @@ class PersistentConsoleWidget(QListWidget):
 
     def _extend_menu(self, menu):
         """Adds two more actions: Restart, and Interrupt."""
+        menu.addSeparator()
+        menu.addAction("Copy", self.copy).setEnabled(self._can_copy)
         menu.addSeparator()
         menu.addAction("Restart", self._restart_persistent)
         menu.addAction("Interrupt", self._interrupt_persistent)
@@ -518,7 +528,7 @@ class Interrupter(PersistentRunnableBase):
 class CommandIssuer(PersistentRunnableBase):
     """A runnable that issues a command."""
 
-    def __init__(self, engine_server_address, persistent_key, command, mutex):
+    def __init__(self, engine_server_address, persistent_key, command):
         """
         Args:
             engine_server_address (str): address of the remote engine, currently should always be an empty string
@@ -527,13 +537,11 @@ class CommandIssuer(PersistentRunnableBase):
         """
         super().__init__(engine_server_address, persistent_key)
         self._command = command
-        self._mutex = mutex
         self.stdin_msg = _Signal()
         self.stdout_msg = _Signal()
         self.stderr_msg = _Signal()
 
     def run(self):
-        self._mutex.lock()
         for msg in self._engine_mngr.issue_persistent_command(self._persistent_key, self._command):
             msg_type = msg["type"]
             if msg_type == "stdin":
@@ -545,7 +553,6 @@ class CommandIssuer(PersistentRunnableBase):
             elif msg_type == "command_finished":
                 self.finished.emit(msg["is_complete"])
                 break
-        self._mutex.unlock()
 
 
 def _font():
@@ -587,3 +594,30 @@ def _make_formatted_text(font, text, format_):
     cursor = QTextCursor(doc)
     cursor.insertText(text, format_)
     return doc.toHtml()
+
+
+def _make_highlighter(language):
+    highlighter = CustomSyntaxHighlighter(None)
+    highlighter.set_style(_STYLE)
+    try:
+        highlighter.lexer = get_lexer_by_name(language)
+    except ClassNotFound:
+        pass
+    return highlighter
+
+
+def _select(text_edit, index):
+    selection = index.data(_SELECTION_ROLE)
+    if selection is None:
+        return
+    cursor = text_edit.textCursor()
+    start, end = selection
+    if start is not None:
+        cursor.setPosition(start)
+    else:
+        cursor.movePosition(QTextCursor.Start)
+    if end is not None:
+        cursor.setPosition(end, QTextCursor.KeepAnchor)
+    else:
+        cursor.movePosition(QTextCursor.End, QTextCursor.KeepAnchor)
+    text_edit.setTextCursor(cursor)
