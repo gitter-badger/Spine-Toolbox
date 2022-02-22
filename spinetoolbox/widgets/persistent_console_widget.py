@@ -216,7 +216,8 @@ class PersistentConsoleWidget(QListWidget):
         """
         super().__init__(parent=toolbox)
         self.setCursor(Qt.IBeamCursor)
-        self.setSpacing(1)
+        self.setSpacing(0)
+        self.setVerticalScrollMode(QListWidget.ScrollPerPixel)
         self.setStyleSheet(f"QListWidget{{background-color: {_BG_COLOR}; border: 0px}}")
         self._toolbox = toolbox
         self._thread_pool = QThreadPool()
