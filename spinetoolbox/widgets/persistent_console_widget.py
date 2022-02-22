@@ -20,9 +20,6 @@ from PySide2.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QStyledItemDelegate,
-    QWidget,
-    QHBoxLayout,
-    QLabel,
     QPlainTextEdit,
     QTextEdit,
     QMenu,
@@ -54,15 +51,38 @@ class PromptType(Enum):
 
 
 class PromptLineEdit(QPlainTextEdit):
-    def __init__(self, console):
+    def __init__(self, console, font):
         super().__init__()
         self._console = console
+        self.cursor_visible = False
+        self.setStyleSheet("background-color: transparent; color:transparent; border: 0px")
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
         self.setUndoRedoEnabled(False)
         self.setCursorWidth(0)
-        char_width = self.fontMetrics().horizontalAdvance("x")
-        self.setTabStopDistance(4 * char_width)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.cursorPositionChanged.connect(self._console.scheduleDelayedItemsLayout)
+        self._timer = QTimer()
+        self._timer.setInterval(600)
+        self._timer.timeout.connect(self._handle_timeout)
+
+    def focusInEvent(self, ev):
+        super().focusInEvent(ev)
+        self._reset_timer()
+
+    def focusOutEvent(self, ev):
+        super().focusOutEvent(ev)
+        self.cursor_visible = False
+        self._timer.stop()
+
+    def _reset_timer(self):
+        self.cursor_visible = True
+        self._timer.start()
+
+    @Slot()
+    def _handle_timeout(self):
+        self.cursor_visible = not self.cursor_visible
+        self._console.scheduleDelayedItemsLayout()
 
     def _get_current_text(self):
         """Returns current text.
@@ -77,6 +97,7 @@ class PromptLineEdit(QPlainTextEdit):
         return text, partial_text
 
     def keyPressEvent(self, ev):
+        self._reset_timer()
         text, partial_text = self._get_current_text()
         if ev.key() in (Qt.Key_Return, Qt.Key_Enter):
             self._console.issue_command(text)
@@ -103,9 +124,7 @@ class PromptDelegate(QStyledItemDelegate):
         self._font = _font()
         self._text_format = QTextCharFormat()
         self._text_format.setForeground(QColor(_FG_COLOR))
-        self.label = QLabel()
-        self.label.setFont(self._font)
-        self.line_edit = PromptLineEdit(console)
+        self.line_edit = PromptLineEdit(console, self._font)
         self._highlighter = _make_highlighter(language)
         self.update_prompt_type(PromptType.NORMAL)
 
@@ -114,39 +133,34 @@ class PromptDelegate(QStyledItemDelegate):
         return self._prompt
 
     def createEditor(self, parent, option, index):
-        editor = QWidget(parent)
-        layout = QHBoxLayout(editor)
-        layout.addWidget(self.label)
-        layout.addWidget(self.line_edit)
-        layout.setSpacing(0)
-        layout.setContentsMargins(0, 0, 0, 0)
-        editor.setStyleSheet("background-color: transparent; color:transparent; border: 0px")
-        editor.setAttribute(Qt.WA_TransparentForMouseEvents)
-        return editor
+        self.line_edit.setParent(parent)
+        return self.line_edit
 
     def update_prompt_type(self, prompt_type):
         self._prompt_type = prompt_type
-        text = {PromptType.NORMAL: self._prompt, PromptType.CONTINUATION: self._cont_prompt}.get(self._prompt_type, "")
-        self.label.setText(text)
 
-    def make_doc(self, index):
+    def _make_doc_and_prompt(self, index):
+        doc = _make_doc(self._font)
         if index.row() == index.model().rowCount() - 1:
-            text = self.line_edit.toPlainText() + "\u2588"
+            text = self.line_edit.toPlainText() + " "
             prompt_type = self._prompt_type
         else:
             text = index.data(Qt.DisplayRole)
             prompt_type = index.data(_PROMPT_ROLE)
         if text is None:
             text = ""
-        doc = _make_doc(self._font)
         cursor = QTextCursor(doc)
         if prompt_type is not None:
             prompt = self._prompt if prompt_type == PromptType.NORMAL else self._cont_prompt
             cursor.insertText(prompt, self._prompt_format)
             self._insert_formatted_text(cursor, text)
         else:
+            prompt = ""
             cursor.insertText(text, self._text_format)
-        return doc
+        return doc, prompt
+
+    def make_doc(self, index):
+        return self._make_doc_and_prompt(index)[0]
 
     def sizeHint(self, option, index):
         doc = self.make_doc(index)
@@ -154,7 +168,7 @@ class PromptDelegate(QStyledItemDelegate):
         return doc.size().toSize()
 
     def paint(self, painter, option, index):
-        doc = self.make_doc(index)
+        doc, prompt = self._make_doc_and_prompt(index)
         text_edit = QTextEdit()
         text_edit.setStyleSheet("background-color: transparent; border: 0px")
         text_edit.setDocument(doc)
@@ -162,6 +176,15 @@ class PromptDelegate(QStyledItemDelegate):
         _select(text_edit, index)
         painter.save()
         painter.translate(option.rect.topLeft())
+        if index.row() == index.model().rowCount() - 1 and self.line_edit.cursor_visible:
+            es = QTextEdit.ExtraSelection()
+            es.cursor = text_edit.textCursor()
+            es.cursor.setPosition(self.line_edit.textCursor().position() + len(prompt))
+            es.cursor.movePosition(QTextCursor.NextCharacter, QTextCursor.KeepAnchor)
+            es.format = QTextCharFormat()
+            es.format.setBackground(QColor(_FG_COLOR))
+            es.format.setForeground(QColor(_BG_COLOR))
+            text_edit.setExtraSelections([es])
         text_edit.render(painter, QPoint(0, 0))
         painter.restore()
 
@@ -217,12 +240,23 @@ class PersistentConsoleWidget(QListWidget):
         self._move_row_column = None
         self._current_row = None
         self._can_copy = False
+        self._delegate.line_edit.textChanged.connect(self._handle_line_edit_text_changed)
+
+    @Slot()
+    def _handle_line_edit_text_changed(self):
+        selection = self.item(self.count() - 1).data(_SELECTION_ROLE)
+        if selection is None:
+            return
+        char_count = self._delegate.line_edit.document().characterCount()
+        start, end = selection
+        if start is not None and start > char_count or end is not None and end > char_count:
+            self.item(self.count() - 1).setData(_SELECTION_ROLE, None)
 
     def mousePressEvent(self, ev):
         super().mousePressEvent(ev)
         if ev.button() != Qt.LeftButton:
             return
-        for row in range(self.model().rowCount()):
+        for row in range(self.count()):
             self.item(row).setData(_SELECTION_ROLE, None)
         if not self.indexAt(ev.pos()).isValid():
             self._press_row_column = None
@@ -358,7 +392,6 @@ class PersistentConsoleWidget(QListWidget):
         item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsEditable)
         self.addItem(item)
         self.openPersistentEditor(self.indexFromItem(item))
-        self._delegate.label.show()
 
     def issue_command(self, text):
         """Issues command.
@@ -375,7 +408,8 @@ class PersistentConsoleWidget(QListWidget):
             issuer.stdin_msg.connect(self.add_stdin)
         self._print_command(text, with_prompt=not self._pending_command_count)
         self._delegate.line_edit.clear()
-        self._delegate.label.hide()
+        self.item(self.count() - 1).setData(_SELECTION_ROLE, None)
+        self._delegate.update_prompt_type(None)
         self._history_index = 0
         self._pending_command_count += 1
         self._thread_pool.start(issuer)
@@ -393,12 +427,11 @@ class PersistentConsoleWidget(QListWidget):
         prompt_type = self._get_prompt_type(with_prompt)
         item.setData(_PROMPT_ROLE, prompt_type)
         with keeping_at_bottom(self):
-            self.insertItem(self.model().rowCount() - 1, item)
+            self.insertItem(self.count() - 1, item)
 
     def _handle_command_finished(self, is_complete):
         self._pending_command_count -= 1
         self._is_last_command_complete = is_complete
-        self._delegate.label.show()
         self._delegate.update_prompt_type(PromptType.NORMAL if is_complete else PromptType.CONTINUATION)
 
     def add_stdin(self, data):
@@ -434,14 +467,17 @@ class PersistentConsoleWidget(QListWidget):
             text (str)
         """
         prompt_type = self._get_prompt_type(with_prompt)
-        self._text_buffer.append((text, prompt_type))
+        max_line_length = 1000
+        for i in range(0, len(text), max_line_length):
+            line = text[i : i + max_line_length]
+            self._text_buffer.append((line, prompt_type))
 
     @Slot()
     def _drain_text_buffer(self):
         """Inserts all text from buffer."""
         if not self._text_buffer:
             return
-        row = self.model().rowCount() - 1
+        row = self.count() - 1
         texts, prompt_types = zip(*self._text_buffer)
         self._text_buffer = []
         with keeping_at_bottom(self):
@@ -450,13 +486,13 @@ class PersistentConsoleWidget(QListWidget):
             item = self.item(row + i)
             item.setFlags(Qt.ItemIsEnabled)
             item.setData(_PROMPT_ROLE, prompt_type)
-        rows_to_remove = self.model().rowCount() - self._MAX_ROWS
+        rows_to_remove = self.count() - self._MAX_ROWS
         if rows_to_remove > 0:
             self.model().removeRows(0, rows_to_remove)
 
     def _restart_persistent(self, _=False):
         """Restarts underlying persistent process."""
-        self.model().removeRows(0, self.model().rowCount() - 1)
+        self.model().removeRows(0, self.count() - 1)
         engine_server_address = self._toolbox.qsettings().value("appSettings/engineServerAddress", defaultValue="")
         restarter = Restarter(engine_server_address, self._key)
         self._thread_pool.start(restarter)
